@@ -1,4 +1,4 @@
-name: Build Still iOS App (.ipa)
+name: Build Still iOS App (.app)
 
 on:
   push:
@@ -37,17 +37,9 @@ jobs:
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY=""
 
-    - name: .ipa Paket erstellen
-      run: |
-        mkdir -p build/Payload
-        cp -R build/DerivedData/Build/Products/Release-iphoneos/Still.app build/Payload/
-        cd build
-        zip -r Still.ipa Payload
-        cd ..
-
-    - name: .ipa Artefakt hochladen
+    - name: .app Artefakt hochladen
       uses: actions/upload-artifact@v4
       if: success()
       with:
-        name: Still-iOS-App-IPA
-        path: build/Still.ipa
+        name: Still-iOS-App-APP
+        path: build/DerivedData/Build/Products/Release-iphoneos/Still.app

@@ -1,431 +1,136 @@
 import AVFoundation
 import Combine
-import Foundation
-import AudioToolbox
-import UserNotifications
-import AVFAudio
 
+/// Manages the AVAudioSession and plays a near-silent tone during Focus Mode.
+///
+/// iOS constraints to be aware of:
+/// - There is no public API to directly set hardware microphone gain.
+/// - The closest we can do is set the input gain via `AVAudioSession.setInputGain(_:)`
+///   only when `isInputGainSettable` is true (device-dependent).
+/// - A silent tone keeps the audio session "warm" so subsequent sounds play
+///   with minimal latency (avoids the hardware ramp-up delay).
 @MainActor
 final class AudioManager: ObservableObject {
-    @Published private(set) var isPlaying = false
-    @Published private(set) var isAlarmPlaying = false
-    @Published private(set) var timerEndDate: Date?
-    @Published private(set) var timerIsPaused = false
-    @Published private(set) var alarmDate: Date?
-    @Published private(set) var timerTick = Date()
-    @Published private(set) var focusElapsed: TimeInterval = 0
 
-    private let audioSession = AVAudioSession.sharedInstance()
-    private var audioEngine: AVAudioEngine?
-    private var timer: Timer?
-    private var pausedRemaining: TimeInterval?
-    private var alarmTimer: Timer?
-    private var alarmStopTask: Task<Void, Never>?
-    private var focusStartedAt: Date?
-    private var focusTicker: Timer?
-    private var alarmPlayer: AVAudioPlayer?
-    private let defaults = UserDefaults(suiteName: "group.com.johannes.still") ?? .standard
-    private let timerNotificationID = "still.timer.finished"
-    private let alarmNotificationID = "still.alarm.fired"
-    private let historyKey = "focusSessionHistory"
+    // MARK: - Published State
+    @Published private(set) var isFocusModeActive: Bool = false
+    @Published private(set) var lastError: String? = nil
 
-    init() {
-        configureAudioSession()
-        restoreState()
-        requestNotificationPermission()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleRouteChange),
-            name: AVAudioSession.routeChangeNotification,
-            object: audioSession
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleInterruption),
-            name: AVAudioSession.interruptionNotification,
-            object: audioSession
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleAlarmNotification),
-            name: .stillAlarmFired,
-            object: nil
-        )
-    }
+    // MARK: - Private
+    private let session = AVAudioSession.sharedInstance()
+    private var engine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var toneBuffer: AVAudioPCMBuffer?
 
-    deinit {
-        NotificationCenter.default.removeObserver(self)
-    }
+    // Silent tone parameters
+    // 20 Hz is below the human hearing threshold – keeps the session alive
+    // without producing audible sound.
+    private let toneSampleRate: Double = 44100
+    private let toneFrequency: Double = 20      // Hz – sub-audible
+    private let toneAmplitude: Float = 0.001    // near-silent
+    private let toneSeconds: Double = 2.0       // looping buffer length
 
-    var timerRemaining: TimeInterval {
-        if timerIsPaused, let pausedRemaining { return pausedRemaining }
-        guard let timerEndDate else { return 0 }
-        return max(0, timerEndDate.timeIntervalSinceNow)
-    }
+    // MARK: - Public API
 
-    func toggleFocus() {
-        isPlaying ? stopFocus() : startFocus()
-    }
-
-    func startFocus() {
-        guard !isPlaying else { return }
+    func startFocusMode() {
+        lastError = nil
         do {
-            try audioSession.setActive(true, options: [])
-            let engine = AVAudioEngine()
-            let format = engine.mainMixerNode.outputFormat(forBus: 0)
-            let source = AVAudioSourceNode { _, _, frameCount, audioBufferList in
-                let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
-                for buffer in buffers {
-                    memset(buffer.mData, 0, Int(buffer.mDataByteSize))
-                }
-                return noErr
-            }
-            engine.attach(source)
-            engine.connect(source, to: engine.mainMixerNode, format: format)
-            engine.mainMixerNode.outputVolume = 1
-            try engine.start()
-            audioEngine = engine
-            isPlaying = true
-            focusStartedAt = Date()
-            focusElapsed = 0
-            focusTicker?.invalidate()
-            focusTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.updateFocusElapsed() }
-            }
-            defaults.set(true, forKey: "focusIsActive")
+            try configureSession()
+            try buildAndStartEngine()
+            playTone()
+            isFocusModeActive = true
         } catch {
-            audioEngine = nil
-            isPlaying = false
-            print("Still audio could not start: \(error.localizedDescription)")
+            lastError = error.localizedDescription
+            isFocusModeActive = false
         }
     }
 
-    func stopFocus() {
-        audioEngine?.stop()
-        audioEngine = nil
-        isPlaying = false
-        focusStartedAt = nil
-        focusElapsed = 0
-        focusTicker?.invalidate()
-        focusTicker = nil
-        defaults.set(false, forKey: "focusIsActive")
-        if !isAlarmPlaying {
-            try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-        }
+    func stopFocusMode() {
+        teardown()
+        isFocusModeActive = false
+        lastError = nil
     }
 
-    func startTimer(duration: TimeInterval) {
-        guard duration > 0 else { return }
-        startFocus()
-        timer?.invalidate()
-        timerEndDate = Date().addingTimeInterval(duration)
-        pausedRemaining = nil
-        timerIsPaused = false
-        defaults.set(duration, forKey: "timerDuration")
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.timerTick = Date(); self?.updateFocusElapsed(); self?.updateTimer() }
-        }
-        scheduleNotification(
-            identifier: timerNotificationID,
-            title: "Timer beendet",
-            body: "Deine Still-Session ist abgeschlossen.",
-            date: timerEndDate!
+    // MARK: - Session Setup
+
+    private func configureSession() throws {
+        // .playAndRecord keeps the mic active (needed for hearing device pass-through)
+        // .allowBluetooth routes audio to BT hearing aids / AirPods
+        // .allowBluetoothA2DP allows A2DP routing as fallback
+        try session.setCategory(
+            .playAndRecord,
+            mode: .default,
+            options: [.allowBluetooth, .allowBluetoothA2DP, .mixWithOthers]
         )
-        persistState()
-    }
 
-    func pauseTimer() {
-        guard let timerEndDate else { return }
-        timer?.invalidate()
-        timer = nil
-        pausedRemaining = max(0, timerEndDate.timeIntervalSinceNow)
-        timerIsPaused = true
-        removeNotification(withIdentifier: timerNotificationID)
-        persistState()
-    }
+        // Lowest possible I/O buffer: reduces latency significantly on supported hardware.
+        // iOS will round up to the nearest supported value (commonly ~5.8 ms on modern iPhones).
+        try session.setPreferredIOBufferDuration(0.005)
+        try session.setPreferredSampleRate(toneSampleRate)
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
 
-    func resumeTimer() {
-        guard timerEndDate != nil else { return }
-        timerEndDate = Date().addingTimeInterval(pausedRemaining ?? timerRemaining)
-        pausedRemaining = nil
-        timerIsPaused = false
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.timerTick = Date(); self?.updateFocusElapsed(); self?.updateTimer() }
-        }
-        scheduleNotification(
-            identifier: timerNotificationID,
-            title: "Timer beendet",
-            body: "Deine Still-Session ist abgeschlossen.",
-            date: timerEndDate!
-        )
-        persistState()
-    }
-
-    func cancelTimer() {
-        timer?.invalidate()
-        timer = nil
-        timerEndDate = nil
-        pausedRemaining = nil
-        timerIsPaused = false
-        defaults.removeObject(forKey: "timerDuration")
-        removeNotification(withIdentifier: timerNotificationID)
-        persistState()
-        if !isAlarmPlaying { stopFocus() }
-    }
-
-    func scheduleAlarm(at date: Date) {
-        alarmTimer?.invalidate()
-        alarmDate = date
-        startFocus()
-        scheduleNotification(
-            identifier: alarmNotificationID,
-            title: "Still-Wecker",
-            body: "Dein Wecker ist fällig.",
-            date: date
-        )
-        persistState()
-        let delay = max(0, date.timeIntervalSinceNow)
-        alarmTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
-            Task { @MainActor in self?.fireAlarm() }
+        // Attempt to minimise mic input gain (best-effort – hardware-dependent).
+        if session.isInputGainSettable {
+            try session.setInputGain(0.0)
         }
     }
 
-    func cancelAlarm() {
-        alarmTimer?.invalidate()
-        alarmTimer = nil
-        alarmDate = nil
-        removeNotification(withIdentifier: alarmNotificationID)
-        persistState()
-        if !isAlarmPlaying && timerEndDate == nil { stopFocus() }
+    // MARK: - AVAudioEngine
+
+    private func buildAndStartEngine() throws {
+        let newEngine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        newEngine.attach(player)
+
+        let format = AVAudioFormat(
+            standardFormatWithSampleRate: toneSampleRate,
+            channels: 1
+        )!
+
+        newEngine.connect(player, to: newEngine.mainMixerNode, format: format)
+
+        toneBuffer = makeToneBuffer(format: format)
+        playerNode = player
+        engine = newEngine
+
+        try newEngine.start()
     }
 
-    private func updateTimer() {
-        guard timerEndDate != nil else { return }
-        if timerRemaining <= 0 {
-            recordSession(duration: defaults.double(forKey: "timerDuration"))
-            cancelTimer()
+    private func playTone() {
+        guard let player = playerNode, let buffer = toneBuffer else { return }
+        player.scheduleBuffer(buffer, at: nil, options: .loops)
+        player.play()
+    }
+
+    // MARK: - Teardown
+
+    private func teardown() {
+        playerNode?.stop()
+        engine?.stop()
+        engine = nil
+        playerNode = nil
+        toneBuffer = nil
+
+        // Deactivate session – notifies other apps (e.g. Music) to resume.
+        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    // MARK: - Tone Buffer
+
+    /// Generates a single-cycle sine wave buffer that loops seamlessly.
+    private func makeToneBuffer(format: AVAudioFormat) -> AVAudioPCMBuffer? {
+        let frameCount = AVAudioFrameCount(toneSampleRate * toneSeconds)
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+            return nil
         }
-    }
+        buffer.frameLength = frameCount
 
-    private func updateFocusElapsed() {
-        guard isPlaying, let focusStartedAt else { return }
-        focusElapsed = Date().timeIntervalSince(focusStartedAt)
-    }
+        guard let channelData = buffer.floatChannelData?[0] else { return nil }
+        let angularFrequency = 2.0 * Double.pi * toneFrequency / toneSampleRate
 
-    private func fireAlarm() {
-        alarmTimer = nil
-        alarmDate = nil
-        persistState()
-        isAlarmPlaying = true
-        stopFocus()
-        guard defaults.bool(forKey: "soundEnabled") else {
-            isAlarmPlaying = false
-            return
+        for frame in 0..<Int(frameCount) {
+            channelData[frame] = Float(sin(Double(frame) * angularFrequency)) * toneAmplitude
         }
-        if defaults.bool(forKey: "vibrationEnabled") {
-            AudioServicesPlaySystemSound(kSystemSoundID_Vibrate)
-        }
-        if playBundledAlarmSound() { return }
-        do {
-            try audioSession.setActive(true, options: [])
-            let engine = AVAudioEngine()
-            let sampleRate = audioSession.sampleRate > 0 ? audioSession.sampleRate : 44_100
-            let frequency = alarmFrequency
-            var phase = 0.0
-            let source = AVAudioSourceNode { _, _, frameCount, audioBufferList in
-                let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
-                let increment = 2.0 * Double.pi * frequency / sampleRate
-                for frame in 0..<Int(frameCount) {
-                    let sample = Float(sin(phase) * 0.18)
-                    phase += increment
-                    for buffer in buffers {
-                        buffer.mData?.assumingMemoryBound(to: Float.self)[frame] = sample
-                    }
-                }
-                return noErr
-            }
-            let format = engine.mainMixerNode.outputFormat(forBus: 0)
-            engine.attach(source)
-            engine.connect(source, to: engine.mainMixerNode, format: format)
-            try engine.start()
-            audioEngine = engine
-        } catch {
-            stopAlarm()
-        }
-    }
-
-    func stopAlarm() {
-        alarmStopTask?.cancel()
-        alarmStopTask = nil
-        audioEngine?.stop()
-        audioEngine = nil
-        alarmPlayer?.stop()
-        alarmPlayer = nil
-        isAlarmPlaying = false
-        try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-    }
-
-    private func configureAudioSession() {
-        do {
-            try audioSession.setCategory(
-                .playback,
-                mode: .default,
-                options: [.allowBluetooth, .allowBluetoothA2DP, .allowBluetoothHFP, .mixWithOthers]
-            )
-        } catch {
-            print("Still audio session could not be configured: \(error.localizedDescription)")
-        }
-    }
-
-    private var alarmFrequency: Double {
-        switch defaults.string(forKey: "alarmSound") ?? "soft" {
-        case "bright": return 1046.5
-        case "deep": return 440
-        default: return 660
-        }
-    }
-
-    private func playBundledAlarmSound() -> Bool {
-        let name = defaults.string(forKey: "alarmSound") ?? "ios-26"
-        guard let url = Bundle.main.url(forResource: name, withExtension: "mp3", subdirectory: "Sounds") else { return false }
-        do { alarmPlayer = try AVAudioPlayer(contentsOf: url); alarmPlayer?.numberOfLoops = -1; alarmPlayer?.play(); alarmStopTask = Task { [weak self] in try? await Task.sleep(for: .seconds(30)); guard !Task.isCancelled else { return }; await MainActor.run { self?.stopAlarm() } }; return true } catch { return false }
-    }
-
-    private func restoreState() {
-        if let timestamp = defaults.object(forKey: "timerEndDate") as? Double {
-            let endDate = Date(timeIntervalSince1970: timestamp)
-            timerEndDate = endDate
-            timerIsPaused = defaults.bool(forKey: "timerIsPaused")
-            pausedRemaining = defaults.object(forKey: "timerPausedRemaining") as? Double
-
-            if timerIsPaused {
-                if pausedRemaining ?? 0 > 0 {
-                    startFocus()
-                } else {
-                    cancelTimer()
-                }
-            } else if endDate > Date() {
-                startFocus()
-                timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-                    Task { @MainActor in self?.timerTick = Date(); self?.updateFocusElapsed(); self?.updateTimer() }
-                }
-                scheduleNotification(
-                    identifier: timerNotificationID,
-                    title: "Timer beendet",
-                    body: "Deine Still-Session ist abgeschlossen.",
-                    date: endDate
-                )
-            } else {
-                cancelTimer()
-            }
-        }
-
-        if let timestamp = defaults.object(forKey: "alarmDate") as? Double {
-            let date = Date(timeIntervalSince1970: timestamp)
-            if date > Date() {
-                alarmDate = date
-                startFocus()
-                alarmTimer = Timer.scheduledTimer(withTimeInterval: date.timeIntervalSinceNow, repeats: false) { [weak self] _ in
-                    Task { @MainActor in self?.fireAlarm() }
-                }
-                scheduleNotification(
-                    identifier: alarmNotificationID,
-                    title: "Still-Wecker",
-                    body: "Dein Wecker ist fällig.",
-                    date: date
-                )
-            } else {
-                defaults.removeObject(forKey: "alarmDate")
-            }
-        }
-    }
-
-    private func persistState() {
-        if let timerEndDate {
-            defaults.set(timerEndDate.timeIntervalSince1970, forKey: "timerEndDate")
-        } else {
-            defaults.removeObject(forKey: "timerEndDate")
-        }
-        defaults.set(timerIsPaused, forKey: "timerIsPaused")
-        if let pausedRemaining {
-            defaults.set(pausedRemaining, forKey: "timerPausedRemaining")
-        } else {
-            defaults.removeObject(forKey: "timerPausedRemaining")
-        }
-        if let alarmDate {
-            defaults.set(alarmDate.timeIntervalSince1970, forKey: "alarmDate")
-        } else {
-            defaults.removeObject(forKey: "alarmDate")
-        }
-    }
-
-    private func requestNotificationPermission() {
-        Task {
-            let center = UNUserNotificationCenter.current()
-            center.setNotificationCategories([
-                UNNotificationCategory(
-                    identifier: "STILL_TIMER",
-                    actions: [
-                        UNNotificationAction(identifier: "STILL_RESUME", title: "Fortsetzen"),
-                        UNNotificationAction(identifier: "STILL_CANCEL", title: "Beenden", options: [.destructive])
-                    ],
-                    intentIdentifiers: []
-                ),
-                UNNotificationCategory(
-                    identifier: "STILL_ALARM",
-                    actions: [UNNotificationAction(identifier: "STILL_CANCEL", title: "Beenden", options: [.destructive])],
-                    intentIdentifiers: []
-                )
-            ])
-            _ = try? await center.requestAuthorization(options: [.alert, .sound])
-        }
-    }
-
-    private func scheduleNotification(identifier: String, title: String, body: String, date: Date) {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        if defaults.bool(forKey: "soundEnabled") {
-            let soundName = UNNotificationSoundName(rawValue: "\(defaults.string(forKey: "alarmSound") ?? "ios-26").mp3")
-            content.sound = identifier == alarmNotificationID ? UNNotificationSound(named: soundName) : .default
-        }
-        content.categoryIdentifier = identifier == alarmNotificationID ? "STILL_ALARM" : "STILL_TIMER"
-        let calendar = Calendar.current
-        let dateComponents = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: date)
-        let trigger = UNCalendarNotificationTrigger(dateMatching: dateComponents, repeats: false)
-        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
-        let center = UNUserNotificationCenter.current()
-        center.removePendingNotificationRequests(withIdentifiers: [identifier])
-        center.add(request)
-    }
-
-    private func removeNotification(withIdentifier identifier: String) {
-        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [identifier])
-    }
-
-    private func recordSession(duration: TimeInterval) {
-        let completedDuration = max(0, duration)
-        guard completedDuration > 0 else { return }
-        var history = defaults.array(forKey: historyKey) as? [[String: Any]] ?? []
-        history.append(["date": Date().timeIntervalSince1970, "duration": completedDuration])
-        defaults.set(Array(history.suffix(50)), forKey: historyKey)
-    }
-
-    @objc private func handleRouteChange() {
-        guard isPlaying, audioEngine?.isRunning == false else { return }
-        startFocus()
-    }
-
-    @objc private func handleInterruption(_ notification: Notification) {
-        guard isPlaying,
-              let info = notification.userInfo,
-              let typeValue = info[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: typeValue),
-              type == .ended else { return }
-        startFocus()
-    }
-
-    @objc private func handleAlarmNotification() {
-        fireAlarm()
+        return buffer
     }
 }
