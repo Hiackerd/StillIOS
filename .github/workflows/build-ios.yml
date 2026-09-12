@@ -1,4 +1,4 @@
-name: Build Still iOS Simulator App
+name: Build Still iOS App (.ipa)
 
 on:
   push:
@@ -25,21 +25,29 @@ jobs:
     - name: Xcode-Projekt generieren
       run: xcodegen generate
 
-    - name: iOS Simulator Build erstellen
+    - name: Unsigned iOS App bauen
       run: |
         xcodebuild build \
           -project Still.xcodeproj \
           -scheme Still \
-          -destination 'generic/platform=iOS Simulator' \
+          -destination 'generic/platform=iOS' \
           -configuration Release \
           -derivedDataPath build/DerivedData \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY=""
 
-    - name: Simulator .app hochladen
+    - name: Unsigned .ipa erstellen
+      run: |
+        mkdir -p build/Payload
+        cp -R build/DerivedData/Build/Products/Release-iphoneos/Still.app build/Payload/Still.app
+        cd build
+        zip -r Still.ipa Payload
+        cd ..
+
+    - name: .ipa Artefakt hochladen
       uses: actions/upload-artifact@v4
       if: success()
       with:
-        name: Still-iOS-Simulator-App
-        path: build/DerivedData/Build/Products/Release-iphonesimulator/Still.app
+        name: Still-iOS-Unsigned-IPA
+        path: build/Still.ipa
