@@ -1,4 +1,4 @@
-name: Build Still iOS App (.app)
+name: Build Still iOS Simulator App
 
 on:
   push:
@@ -25,21 +25,21 @@ jobs:
     - name: Xcode-Projekt generieren
       run: xcodegen generate
 
-    - name: App für echtes iOS-Gerät kompilieren
+    - name: iOS Simulator Build erstellen
       run: |
         xcodebuild build \
           -project Still.xcodeproj \
           -scheme Still \
-          -destination 'generic/platform=iOS' \
+          -destination 'generic/platform=iOS Simulator' \
           -configuration Release \
           -derivedDataPath build/DerivedData \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY=""
 
-    - name: .app Artefakt hochladen
+    - name: Simulator .app hochladen
       uses: actions/upload-artifact@v4
       if: success()
       with:
-        name: Still-iOS-App-APP
-        path: build/DerivedData/Build/Products/Release-iphoneos/Still.app
+        name: Still-iOS-Simulator-App
+        path: build/DerivedData/Build/Products/Release-iphonesimulator/Still.app
