@@ -1,139 +1,178 @@
 import SwiftUI
 
 struct SplashView: View {
-    @State private var logoScale: CGFloat = 0.4
-    @State private var logoOpacity: Double = 0
-    @State private var ring1Scale: CGFloat = 0.3
-    @State private var ring1Opacity: Double = 0
-    @State private var ring2Scale: CGFloat = 0.3
-    @State private var ring2Opacity: Double = 0
-    @State private var titleOpacity: Double = 0
-    @State private var titleOffset: CGFloat = 12
-    @State private var bgOpacity: Double = 0
+
+    // Mesh animation
+    @State private var t: CGFloat = 0
+    private let timer = Timer.publish(every: 0.016, on: .main, in: .common).autoconnect()
+
+    // Entrance states
+    @State private var cardOffset: CGFloat = 60
+    @State private var cardOpacity: Double = 0
+    @State private var cardBlur: CGFloat = 20
+    @State private var iconOffset: CGFloat = 8
+    @State private var iconOpacity: Double = 0
+    @State private var labelOpacity: Double = 0
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                // Background
-                Color(hex: "0A0E1A")
+
+                // ── Animated mesh background ──────────────────────────────
+                animatedBackground(geo: geo)
                     .ignoresSafeArea()
-                    .opacity(bgOpacity)
 
-                // Ambient glow
-                RadialGradient(
-                    colors: [
-                        Color(hex: "5B8BDF").opacity(0.18),
-                        Color.clear
-                    ],
-                    center: .center,
-                    startRadius: 0,
-                    endRadius: geo.size.width * 0.6
-                )
-                .ignoresSafeArea()
-                .opacity(ring1Opacity)
-
-                // Pulse rings
-                Circle()
-                    .stroke(Color(hex: "5B8BDF").opacity(0.15), lineWidth: 1)
-                    .frame(width: geo.size.width * 0.75)
-                    .scaleEffect(ring2Scale)
-                    .opacity(ring2Opacity)
-
-                Circle()
-                    .stroke(Color(hex: "5B8BDF").opacity(0.25), lineWidth: 1.5)
-                    .frame(width: geo.size.width * 0.5)
-                    .scaleEffect(ring1Scale)
-                    .opacity(ring1Opacity)
-
-                // Center content
+                // ── Floating glass card ───────────────────────────────────
                 VStack(spacing: 0) {
                     Spacer()
 
-                    // Icon
-                    ZStack {
-                        Circle()
-                            .fill(Color(hex: "1A2140"))
-                            .frame(width: 96, height: 96)
-                            .shadow(color: Color(hex: "5B8BDF").opacity(0.4), radius: 24, x: 0, y: 0)
-
-                        Image(systemName: "ear.badge.waveform")
-                            .font(.system(size: 40, weight: .light))
-                            .foregroundStyle(
-                                LinearGradient(
-                                    colors: [Color(hex: "A8C4F0"), Color(hex: "5B8BDF")],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                    }
-                    .scaleEffect(logoScale)
-                    .opacity(logoOpacity)
-
-                    Spacer().frame(height: 28)
-
-                    // Title
-                    VStack(spacing: 6) {
-                        Text("still")
-                            .font(.system(size: 48, weight: .thin, design: .rounded))
-                            .tracking(12)
-                            .foregroundStyle(Color(hex: "E8EFF8"))
-
-                        Text("Hörgeräte · Focus Mode")
-                            .font(.system(size: 13, weight: .regular, design: .rounded))
-                            .tracking(2)
-                            .foregroundStyle(Color(hex: "A8C4F0").opacity(0.7))
-                    }
-                    .opacity(titleOpacity)
-                    .offset(y: titleOffset)
+                    glassCard(geo: geo)
+                        .offset(y: cardOffset)
+                        .opacity(cardOpacity)
+                        .blur(radius: cardBlur)
 
                     Spacer()
+                        .frame(height: geo.size.height * 0.12)
                 }
             }
         }
-        .onAppear { animate() }
+        .onAppear { runEntrance() }
+        .onReceive(timer) { _ in
+            t += 0.008
+        }
     }
 
-    private func animate() {
-        // Background fade
-        withAnimation(.easeIn(duration: 0.3)) {
-            bgOpacity = 1
+    // MARK: – Background
+
+    @ViewBuilder
+    private func animatedBackground(geo: GeometryProxy) -> some View {
+        let w = geo.size.width
+        let h = geo.size.height
+
+        ZStack {
+            Color(red: 0.06, green: 0.06, blue: 0.14)
+
+            // Blob 1 – blau
+            ellipseBlob(
+                color: Color(red: 0.18, green: 0.38, blue: 0.82),
+                width: w * 0.85,
+                height: w * 0.7,
+                x: w * 0.5 + sin(t * 0.7) * w * 0.12,
+                y: h * 0.28 + cos(t * 0.5) * h * 0.06
+            )
+            // Blob 2 – violett
+            ellipseBlob(
+                color: Color(red: 0.42, green: 0.22, blue: 0.78),
+                width: w * 0.65,
+                height: w * 0.6,
+                x: w * 0.25 + cos(t * 0.6) * w * 0.1,
+                y: h * 0.58 + sin(t * 0.8) * h * 0.08
+            )
+            // Blob 3 – türkis
+            ellipseBlob(
+                color: Color(red: 0.08, green: 0.55, blue: 0.72),
+                width: w * 0.55,
+                height: w * 0.45,
+                x: w * 0.78 + sin(t * 0.9) * w * 0.08,
+                y: h * 0.7 + cos(t * 0.55) * h * 0.07
+            )
         }
-        // Logo pop
-        withAnimation(.spring(response: 0.6, dampingFraction: 0.65).delay(0.2)) {
-            logoScale = 1
-            logoOpacity = 1
+        .compositingGroup()
+    }
+
+    private func ellipseBlob(
+        color: Color,
+        width: CGFloat,
+        height: CGFloat,
+        x: CGFloat,
+        y: CGFloat
+    ) -> some View {
+        Ellipse()
+            .fill(color.opacity(0.45))
+            .frame(width: width, height: height)
+            .blur(radius: 70)
+            .position(x: x, y: y)
+    }
+
+    // MARK: – Glass Card
+
+    @ViewBuilder
+    private func glassCard(geo: GeometryProxy) -> some View {
+        VStack(spacing: 20) {
+
+            // Icon
+            Image(systemName: "waveform.and.magnifyingglass")
+                .font(.system(size: 44, weight: .ultraLight))
+                .foregroundStyle(.white.opacity(0.9))
+                .offset(y: iconOffset)
+                .opacity(iconOpacity)
+
+            // Wordmark
+            VStack(spacing: 5) {
+                Text("still")
+                    .font(.system(size: 42, weight: .thin, design: .rounded))
+                    .tracking(14)
+                    .foregroundStyle(.white)
+
+                Text("Hörgeräte · Focus Mode")
+                    .font(.system(size: 12, weight: .regular, design: .rounded))
+                    .tracking(2.5)
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+            .opacity(labelOpacity)
         }
-        // Ring 1
-        withAnimation(.easeOut(duration: 0.8).delay(0.35)) {
-            ring1Scale = 1
-            ring1Opacity = 1
+        .padding(.horizontal, 48)
+        .padding(.vertical, 44)
+        .background {
+            RoundedRectangle(cornerRadius: 32, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay {
+                    // Top highlight — the hallmark of glass
+                    RoundedRectangle(cornerRadius: 32, style: .continuous)
+                        .stroke(
+                            LinearGradient(
+                                colors: [.white.opacity(0.45), .white.opacity(0.05)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                }
         }
-        // Ring 2
-        withAnimation(.easeOut(duration: 1.0).delay(0.5)) {
-            ring2Scale = 1
-            ring2Opacity = 1
+        .shadow(color: .black.opacity(0.3), radius: 40, x: 0, y: 20)
+        .padding(.horizontal, 40)
+    }
+
+    // MARK: – Entrance
+
+    private func runEntrance() {
+        withAnimation(.spring(response: 0.75, dampingFraction: 0.72).delay(0.15)) {
+            cardOffset = 0
+            cardOpacity = 1
+            cardBlur = 0
         }
-        // Title slide up
-        withAnimation(.easeOut(duration: 0.5).delay(0.65)) {
-            titleOpacity = 1
-            titleOffset = 0
+        withAnimation(.easeOut(duration: 0.5).delay(0.45)) {
+            iconOffset = 0
+            iconOpacity = 1
+        }
+        withAnimation(.easeOut(duration: 0.45).delay(0.6)) {
+            labelOpacity = 1
         }
     }
 }
 
-// MARK: - Color helper
+// MARK: - Color hex helper (shared)
 extension Color {
     init(hex: String) {
-        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-        var int: UInt64 = 0
-        Scanner(string: hex).scanHexInt64(&int)
-        let r = Double((int >> 16) & 0xFF) / 255
-        let g = Double((int >> 8) & 0xFF) / 255
-        let b = Double(int & 0xFF) / 255
-        self.init(red: r, green: g, blue: b)
+        let h = hex.trimmingCharacters(in: .alphanumerics.inverted)
+        var v: UInt64 = 0
+        Scanner(string: h).scanHexInt64(&v)
+        self.init(
+            red:   Double((v >> 16) & 0xFF) / 255,
+            green: Double((v >>  8) & 0xFF) / 255,
+            blue:  Double( v        & 0xFF) / 255
+        )
     }
 }
 
-#Preview {
-    SplashView()
-}
+#Preview { SplashView() }
